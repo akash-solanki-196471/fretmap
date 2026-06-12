@@ -53,6 +53,7 @@ export default function FretboardTrainer() {
   // settings
   const [mode, setMode] = useState("find"); // 'find' | 'findall' | 'name'
   const [stringSpecific, setStringSpecific] = useState(false); // find mode: pin to one string
+  const [practiceString, setPracticeString] = useState("any"); // 'any' = random each round | 0..5 = always that string
   const [pace, setPace] = useState("timed"); // 'relaxed' (no countdown) | 'timed'
   const [timeLimit, setTimeLimit] = useState(6);
   const [maxFret, setMaxFret] = useState(12);
@@ -100,15 +101,18 @@ export default function FretboardTrainer() {
       const sr = ctx.sampleRate;
       const freq = 440 * Math.pow(2, (midi - 69) / 12);
       const N = Math.max(2, Math.round(sr / freq));
-      const dur = 1.4;
+      const dur = 2.2;
       const buf = ctx.createBuffer(1, Math.floor(sr * dur), sr);
       const data = buf.getChannelData(0);
       const dl = new Float32Array(N);
       for (let i = 0; i < N; i++) dl[i] = Math.random() * 2 - 1;
       let ptr = 0;
+      // bright: 0 = fully averaged (dark/damped), 1 = undamped; loop gain sets sustain
+      const bright = 0.45, loopGain = 0.998;
       for (let n = 0; n < data.length; n++) {
         const next = (ptr + 1) % N;
-        const out = (dl[ptr] + dl[next]) * 0.4985; // averaging lowpass + decay
+        const avgd = (dl[ptr] + dl[next]) * 0.5;
+        const out = loopGain * (avgd + bright * (dl[next] - avgd));
         dl[ptr] = out;
         data[n] = out;
         ptr = next;
@@ -116,13 +120,13 @@ export default function FretboardTrainer() {
       const src = ctx.createBufferSource();
       src.buffer = buf;
       const g = ctx.createGain();
-      g.gain.setValueAtTime(0.45, ctx.currentTime);
+      g.gain.setValueAtTime(0.5, ctx.currentTime);
       g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
       src.connect(g).connect(ctx.destination);
       src.start();
     } catch (e) { /* audio unavailable — drill works silently */ }
   };
-  const settingsKey = `${mode}|${stringSpecific}|${maxFret}|${naturalsOnly}|${pace}`;
+  const settingsKey = `${mode}|${stringSpecific}|${practiceString}|${maxFret}|${naturalsOnly}|${pace}`;
 
   const fretX = useMemo(() => {
     const span = 1 - Math.pow(2, -maxFret / 12);
@@ -168,10 +172,16 @@ export default function FretboardTrainer() {
 
   const pickRound = () => {
     const pool = naturalsOnly ? NATURALS : NOTES;
-    const weak = focusWeak ? weakNotesIn(pool) : [];
+    const pinned = mode === "find" && stringSpecific && practiceString !== "any";
+    const weak = focusWeak && !pinned ? weakNotesIn(pool) : [];
     for (let i = 0; i < 80; i++) {
       let s, f, n;
-      if (weak.length && Math.random() < 0.45) {
+      if (pinned) {
+        s = practiceString;
+        f = Math.floor(Math.random() * (maxFret + 1));
+        n = noteAt(s, f);
+        if (!pool.includes(n)) continue;
+      } else if (weak.length && Math.random() < 0.45) {
         n = weak[Math.floor(Math.random() * weak.length)];
         const ps = allPositionsOf(n);
         const p = ps[Math.floor(Math.random() * ps.length)];
@@ -670,6 +680,17 @@ export default function FretboardTrainer() {
               <div className="ft-seg">
                 <button className={!stringSpecific ? "on" : ""} onClick={() => setStringSpecific(false)}>any string</button>
                 <button className={stringSpecific ? "on" : ""} onClick={() => setStringSpecific(true)}>specific string</button>
+              </div>
+            </div>
+          )}
+          {mode === "find" && stringSpecific && (
+            <div className="ft-field">
+              <span>which string</span>
+              <div className="ft-seg">
+                <button className={practiceString === "any" ? "on" : ""} onClick={() => setPracticeString("any")}>mix</button>
+                {STRINGS.map((st, s) => (
+                  <button key={s} className={practiceString === s ? "on" : ""} onClick={() => setPracticeString(s)}>{st.label}</button>
+                ))}
               </div>
             </div>
           )}
