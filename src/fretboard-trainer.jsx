@@ -101,14 +101,32 @@ export default function FretboardTrainer() {
       const sr = ctx.sampleRate;
       const freq = 440 * Math.pow(2, (midi - 69) / 12);
       const N = Math.max(2, Math.round(sr / freq));
-      const dur = 2.2;
+      const dur = 2.8;
       const buf = ctx.createBuffer(1, Math.floor(sr * dur), sr);
       const data = buf.getChannelData(0);
+      // excitation: doubly lowpassed noise tracking the pitch (~1/k² harmonic
+      // rolloff, like a real plucked string) with a light pick-position comb —
+      // warm fundamental, soft attack instead of the plasticky KS click
+      const a = Math.exp(-2 * Math.PI * 2 * freq / sr);
+      const raw = new Float32Array(N);
+      let l1 = 0, l2 = 0;
+      for (let i = 0; i < N; i++) {
+        l1 = a * l1 + (1 - a) * (Math.random() * 2 - 1);
+        l2 = a * l2 + (1 - a) * l1;
+        raw[i] = l2;
+      }
+      const pickAt = Math.max(1, Math.floor(N * 0.12));
       const dl = new Float32Array(N);
-      for (let i = 0; i < N; i++) dl[i] = Math.random() * 2 - 1;
+      let mean = 0, peakEx = 0;
+      for (let i = 0; i < N; i++) { dl[i] = raw[i] - 0.5 * raw[(i + pickAt) % N]; mean += dl[i]; }
+      mean /= N;
+      for (let i = 0; i < N; i++) { dl[i] -= mean; peakEx = Math.max(peakEx, Math.abs(dl[i])); }
+      for (let i = 0; i < N; i++) dl[i] /= peakEx || 1;
       let ptr = 0;
-      // bright: 0 = fully averaged (dark/damped), 1 = undamped; loop gain sets sustain
-      const bright = 0.45, loopGain = 0.998;
+      // bright: 0 = fully averaged (dark) … 1 = undamped; wound low strings
+      // are mellower than plain high strings. loop gain sets the ring-out.
+      const bright = Math.max(0.2, Math.min(0.42, 0.2 + (midi - 45) * 0.011));
+      const loopGain = 0.9985;
       for (let n = 0; n < data.length; n++) {
         const next = (ptr + 1) % N;
         const avgd = (dl[ptr] + dl[next]) * 0.5;
@@ -119,10 +137,15 @@ export default function FretboardTrainer() {
       }
       const src = ctx.createBufferSource();
       src.buffer = buf;
+      // body: warm low-mid bump + roll off the fizz
+      const body = ctx.createBiquadFilter();
+      body.type = "peaking"; body.frequency.value = 180; body.gain.value = 4; body.Q.value = 0.8;
+      const lpf = ctx.createBiquadFilter();
+      lpf.type = "lowpass"; lpf.frequency.value = 3200; lpf.Q.value = 0.5;
       const g = ctx.createGain();
-      g.gain.setValueAtTime(0.5, ctx.currentTime);
+      g.gain.setValueAtTime(0.58, ctx.currentTime);
       g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
-      src.connect(g).connect(ctx.destination);
+      src.connect(body).connect(lpf).connect(g).connect(ctx.destination);
       src.start();
     } catch (e) { /* audio unavailable — drill works silently */ }
   };
@@ -472,7 +495,7 @@ export default function FretboardTrainer() {
           <div className="ft-badges">
             <span className="ft-lvl">LVL {lv.level}</span>
             {store.dayStreak > 1 && <span className="ft-flame">🔥 {store.dayStreak}-day streak</span>}
-            <span className="ft-sub">standard tuning · E A D G B e</span>
+            <span className="ft-sub">standard tuning · E A D G B e · v4</span>
           </div>
         </div>
 
