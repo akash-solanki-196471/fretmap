@@ -1,0 +1,537 @@
+import { useState, useEffect, useRef, useMemo } from "react";
+
+// ---------- music data ----------
+const NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const NATURALS = ["C", "D", "E", "F", "G", "A", "B"];
+// display top -> bottom: high e, B, G, D, A, low E (standard chart orientation)
+const STRINGS = [
+  { label: "e", open: 4, midi: 64 },
+  { label: "B", open: 11, midi: 59 },
+  { label: "G", open: 7, midi: 55 },
+  { label: "D", open: 2, midi: 50 },
+  { label: "A", open: 9, midi: 45 },
+  { label: "E", open: 4, midi: 40 },
+];
+const noteAt = (s, f) => NOTES[(STRINGS[s].open + f) % 12];
+const midiAt = (s, f) => STRINGS[s].midi + f;
+const stringName = (s) => (s === 0 ? "high e" : s === 5 ? "low E" : STRINGS[s].label);
+const key = (s, f) => `${s}-${f}`;
+
+// ---------- geometry (real fret spacing: 1 - 2^(-n/12)) ----------
+const W = 1000, H = 280, NUT = 92, END = 982, TOP = 38, GAP = 41;
+const stringY = (s) => TOP + GAP * s;
+
+export default function FretboardTrainer() {
+  // settings
+  const [mode, setMode] = useState("find"); // 'find' | 'findall' | 'name'
+  const [stringSpecific, setStringSpecific] = useState(false); // find mode: pin to one string
+  const [timeLimit, setTimeLimit] = useState(3);
+  const [maxFret, setMaxFret] = useState(12);
+  const [naturalsOnly, setNaturalsOnly] = useState(true);
+  const [soundOn, setSoundOn] = useState(true);
+
+  // session
+  const [phase, setPhase] = useState("idle"); // idle | playing | feedback
+  const [round, setRound] = useState(null);
+  const [found, setFound] = useState([]); // findall: keys already hit
+  const [feedback, setFeedback] = useState(null);
+  const [progress, setProgress] = useState(1);
+  const [stats, setStats] = useState({ correct: 0, total: 0, streak: 0, best: 0, timeSum: 0 });
+
+  const timerRef = useRef(null);
+  const advanceRef = useRef(null);
+  const startedAtRef = useRef(0);
+  const limitRef = useRef(3);
+  const lastTargetRef = useRef(null);
+  const foundRef = useRef([]);
+  const audioRef = useRef(null);
+  const soundOnRef = useRef(true);
+  useEffect(() => { soundOnRef.current = soundOn; }, [soundOn]);
+
+  // Karplus-Strong plucked string — no samples needed
+  const pluck = (midi) => {
+    if (!soundOnRef.current) return;
+    try {
+      if (!audioRef.current) audioRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      const ctx = audioRef.current;
+      if (ctx.state === "suspended") ctx.resume();
+      const sr = ctx.sampleRate;
+      const freq = 440 * Math.pow(2, (midi - 69) / 12);
+      const N = Math.max(2, Math.round(sr / freq));
+      const dur = 1.4;
+      const buf = ctx.createBuffer(1, Math.floor(sr * dur), sr);
+      const data = buf.getChannelData(0);
+      const dl = new Float32Array(N);
+      for (let i = 0; i < N; i++) dl[i] = Math.random() * 2 - 1;
+      let ptr = 0;
+      for (let n = 0; n < data.length; n++) {
+        const next = (ptr + 1) % N;
+        const out = (dl[ptr] + dl[next]) * 0.4985; // averaging lowpass + decay
+        dl[ptr] = out;
+        data[n] = out;
+        ptr = next;
+      }
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.45, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
+      src.connect(g).connect(ctx.destination);
+      src.start();
+    } catch (e) { /* audio unavailable — drill works silently */ }
+  };
+  const settingsKey = `${mode}|${stringSpecific}|${maxFret}|${naturalsOnly}`;
+
+  const fretX = useMemo(() => {
+    const span = 1 - Math.pow(2, -maxFret / 12);
+    return (f) => NUT + (END - NUT) * ((1 - Math.pow(2, -f / 12)) / span);
+  }, [maxFret]);
+  const posX = (f) => (f === 0 ? NUT - 26 : (fretX(f - 1) + fretX(f)) / 2);
+
+  const allPositionsOf = (note) => {
+    const out = [];
+    for (let s = 0; s < 6; s++)
+      for (let f = 0; f <= maxFret; f++)
+        if (noteAt(s, f) === note) out.push({ s, f });
+    return out;
+  };
+
+  const clearTimers = () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (advanceRef.current) clearTimeout(advanceRef.current);
+    timerRef.current = advanceRef.current = null;
+  };
+
+  // stop the drill when settings change mid-session
+  useEffect(() => {
+    clearTimers();
+    setPhase("idle");
+    setRound(null);
+    setFound([]);
+    setFeedback(null);
+    setProgress(1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsKey]);
+
+  useEffect(() => () => { clearTimers(); audioRef.current?.close?.(); }, []);
+
+  const pickRound = () => {
+    const pool = naturalsOnly ? NATURALS : NOTES;
+    for (let i = 0; i < 80; i++) {
+      const s = Math.floor(Math.random() * 6);
+      const f = Math.floor(Math.random() * (maxFret + 1));
+      const n = noteAt(s, f);
+      if (!pool.includes(n)) continue;
+      const k = mode === "name" ? key(s, f) : mode === "find" && stringSpecific ? `${n}@${s}` : n;
+      if (k === lastTargetRef.current && i < 70) continue;
+      lastTargetRef.current = k;
+      if (mode === "findall") return { targetNote: n, positions: allPositionsOf(n) };
+      if (mode === "find" && stringSpecific) return { targetNote: n, targetString: s, targetPos: { s, f } };
+      return { targetNote: n, targetPos: { s, f } };
+    }
+    return { targetNote: "E", targetPos: { s: 5, f: 0 }, positions: allPositionsOf("E") };
+  };
+
+  const startRound = () => {
+    clearTimers();
+    setFeedback(null);
+    const r = pickRound();
+    setRound(r);
+    setFound([]);
+    foundRef.current = [];
+    // sound the target: exact position pitch, or a mid-neck reference for find-all
+    if (r.targetPos) pluck(midiAt(r.targetPos.s, r.targetPos.f));
+    else if (r.positions?.length) {
+      const mid = r.positions[Math.floor(r.positions.length / 2)];
+      pluck(midiAt(mid.s, mid.f));
+    }
+    setPhase("playing");
+    setProgress(1);
+    limitRef.current = mode === "findall" ? timeLimit * r.positions.length : timeLimit;
+    startedAtRef.current = performance.now();
+    timerRef.current = setInterval(() => {
+      const el = (performance.now() - startedAtRef.current) / 1000;
+      const p = Math.max(0, 1 - el / limitRef.current);
+      setProgress(p);
+      if (p <= 0) {
+        clearInterval(timerRef.current);
+        finish("timeout");
+      }
+    }, 50);
+  };
+
+  const finish = (type, extra = {}) => {
+    clearTimers();
+    const elapsed = (performance.now() - startedAtRef.current) / 1000;
+    setStats((st) => {
+      const ok = type === "correct";
+      const streak = ok ? st.streak + 1 : 0;
+      return {
+        correct: st.correct + (ok ? 1 : 0),
+        total: st.total + 1,
+        streak,
+        best: Math.max(st.best, streak),
+        timeSum: st.timeSum + (ok ? elapsed : 0),
+      };
+    });
+    setFeedback({ type, ...extra });
+    setPhase("feedback");
+    advanceRef.current = setTimeout(startRound, type === "correct" ? 800 : 1800);
+  };
+
+  const handleFretClick = (s, f) => {
+    if (phase !== "playing" || mode === "name") return;
+    pluck(midiAt(s, f)); // every tap sounds its real pitch, right or wrong
+    const hit = noteAt(s, f) === round.targetNote;
+
+    if (mode === "findall") {
+      if (!hit) return finish("wrong", { clickedPos: { s, f } });
+      const k = key(s, f);
+      if (foundRef.current.includes(k)) return; // already collected
+      const next = [...foundRef.current, k];
+      foundRef.current = next;
+      setFound(next);
+      if (next.length === round.positions.length) finish("correct");
+      return;
+    }
+
+    // find mode
+    const onString = !stringSpecific || s === round.targetString;
+    if (hit && onString) finish("correct", { clickedPos: { s, f } });
+    else finish("wrong", { clickedPos: { s, f } });
+  };
+
+  const handleAnswer = (n) => {
+    if (phase !== "playing" || mode !== "name") return;
+    const truth = noteAt(round.targetPos.s, round.targetPos.f);
+    pluck(midiAt(round.targetPos.s, round.targetPos.f)); // replay to bind sound ↔ name
+    finish(n === truth ? "correct" : "wrong", { chosenNote: n });
+  };
+
+  const stop = () => {
+    clearTimers();
+    setPhase("idle");
+    setRound(null);
+    setFound([]);
+    setFeedback(null);
+    setProgress(1);
+  };
+
+  // positions to reveal after a miss
+  const revealPositions = useMemo(() => {
+    if (!round) return [];
+    if (mode === "name") return [];
+    let pos = round.positions || allPositionsOf(round.targetNote);
+    if (mode === "find" && stringSpecific) pos = pos.filter((p) => p.s === round.targetString);
+    if (mode === "findall") pos = pos.filter((p) => !found.includes(key(p.s, p.f)));
+    return pos;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [round, mode, stringSpecific, maxFret, found]);
+
+  const avg = stats.correct ? (stats.timeSum / stats.correct).toFixed(2) : "—";
+  const showReveal = phase === "feedback" && feedback && feedback.type !== "correct" && mode !== "name";
+  const answerPool = naturalsOnly ? NATURALS : NOTES;
+  const truthNote = round?.targetPos ? noteAt(round.targetPos.s, round.targetPos.f) : null;
+  const foundDots = (mode === "findall" && round) ? round.positions.filter((p) => found.includes(key(p.s, p.f))) : [];
+  const singleInlays = [3, 5, 7, 9].filter((f) => f <= maxFret);
+  const clickable = mode !== "name";
+
+  return (
+    <div className="ft-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=JetBrains+Mono:wght@400;600;800&display=swap');
+        .ft-root{
+          --bg:#171210; --panel:#211a15; --panel2:#2a211a; --line:#3a2e23;
+          --ink:#efe6d8; --dim:#a08c75; --brass:#d49a43; --brass2:#f0bd6e;
+          --good:#84b56f; --bad:#cd5b4d;
+          min-height:100vh; background:
+            radial-gradient(1100px 500px at 50% -10%, #241a12 0%, var(--bg) 60%);
+          color:var(--ink); font-family:'JetBrains Mono',monospace;
+          padding:22px 16px 48px; box-sizing:border-box;
+        }
+        .ft-wrap{max-width:1060px;margin:0 auto}
+        .ft-head{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+        .ft-title{font-family:'Fraunces',serif;font-weight:700;font-size:clamp(22px,3.4vw,32px);letter-spacing:.01em;margin:0}
+        .ft-title em{font-style:normal;color:var(--brass)}
+        .ft-sub{color:var(--dim);font-size:12px}
+        .ft-board{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 10px 8px;overflow-x:auto}
+        .ft-board svg{display:block;min-width:680px;width:100%;height:auto}
+        .ft-cell{cursor:pointer}
+        .ft-cell:hover .ft-hover{opacity:.85}
+        .ft-prompt{display:flex;align-items:center;justify-content:center;gap:18px;min-height:96px;
+          background:var(--panel);border:1px solid var(--line);border-radius:14px;margin-top:14px;padding:14px 18px;flex-wrap:wrap;position:relative;overflow:hidden}
+        .ft-target{font-size:clamp(40px,7vw,64px);font-weight:800;color:var(--brass2);line-height:1}
+        .ft-task{color:var(--dim);font-size:13px;max-width:260px}
+        .ft-task b{color:var(--ink)}
+        .ft-count{font-size:13px;color:var(--brass2);font-weight:600;margin-top:6px}
+        .ft-timer{position:absolute;left:0;bottom:0;height:4px;background:linear-gradient(90deg,var(--brass),var(--brass2));transition:none}
+        .ft-timer.low{background:var(--bad)}
+        .ft-verdict{font-size:clamp(22px,3.4vw,34px);font-weight:800}
+        .ft-verdict.ok{color:var(--good)} .ft-verdict.no{color:var(--bad)}
+        .ft-notes{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+        .ft-notebtn{font-family:inherit;font-weight:800;font-size:18px;min-width:52px;padding:12px 8px;border-radius:10px;
+          border:1px solid var(--line);background:var(--panel2);color:var(--ink);cursor:pointer}
+        .ft-notebtn:hover{border-color:var(--brass)}
+        .ft-notebtn:focus-visible{outline:2px solid var(--brass2);outline-offset:2px}
+        .ft-notebtn.right{background:var(--good);color:#15200f;border-color:var(--good)}
+        .ft-notebtn.wrongpick{background:var(--bad);color:#2a0f0a;border-color:var(--bad)}
+        .ft-notebtn:disabled{cursor:default}
+        .ft-controls{display:flex;gap:10px 18px;flex-wrap:wrap;align-items:flex-end;margin-top:14px;
+          background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px 14px}
+        .ft-field{display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--dim)}
+        .ft-seg{display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+        .ft-seg button{font-family:inherit;font-size:12px;padding:8px 12px;border:0;background:transparent;color:var(--dim);cursor:pointer;white-space:nowrap}
+        .ft-seg button.on{background:var(--brass);color:#241804;font-weight:600}
+        .ft-range{display:flex;align-items:center;gap:8px}
+        input[type=range].ft-slider{accent-color:var(--brass);width:120px}
+        .ft-val{color:var(--ink);font-weight:600;font-size:13px;min-width:42px}
+        .ft-check{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink);cursor:pointer;user-select:none;padding:9px 0}
+        .ft-check input{accent-color:var(--brass);width:15px;height:15px}
+        .ft-go{margin-left:auto;font-family:inherit;font-weight:800;font-size:14px;letter-spacing:.04em;
+          padding:11px 22px;border-radius:10px;border:0;cursor:pointer;background:var(--brass);color:#241804}
+        .ft-go.stop{background:transparent;border:1px solid var(--line);color:var(--dim)}
+        .ft-go:focus-visible{outline:2px solid var(--brass2);outline-offset:2px}
+        .ft-stats{display:flex;gap:22px;flex-wrap:wrap;margin-top:12px;padding:0 6px;color:var(--dim);font-size:12px}
+        .ft-stats b{color:var(--ink);font-size:15px;margin-right:5px}
+        .ft-hint{color:var(--dim);font-size:11px;margin-top:8px;padding:0 6px}
+        @keyframes ftpulse{0%,100%{r:13}50%{r:16}}
+        .ft-pulse{animation:ftpulse 1s ease-in-out infinite}
+        @media (prefers-reduced-motion: reduce){ .ft-pulse{animation:none} }
+      `}</style>
+
+      <div className="ft-wrap">
+        <div className="ft-head">
+          <h1 className="ft-title">Fret<em>map</em></h1>
+          <div className="ft-sub">standard tuning · E A D G B e</div>
+        </div>
+
+        {/* fretboard */}
+        <div className="ft-board">
+          <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Guitar fretboard">
+            <defs>
+              <linearGradient id="wood" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stopColor="#4a3322" />
+                <stop offset="0.5" stopColor="#3c2a1c" />
+                <stop offset="1" stopColor="#2d1f14" />
+              </linearGradient>
+            </defs>
+            <rect x={NUT} y={TOP - 22} width={END - NUT} height={GAP * 5 + 44} rx="3" fill="url(#wood)" />
+            <rect x={NUT - 7} y={TOP - 22} width="7" height={GAP * 5 + 44} fill="#e8dfcb" rx="2" />
+            {Array.from({ length: maxFret }, (_, i) => i + 1).map((f) => (
+              <line key={f} x1={fretX(f)} x2={fretX(f)} y1={TOP - 22} y2={TOP + GAP * 5 + 22} stroke="#8a7a64" strokeWidth="2.5" />
+            ))}
+            {singleInlays.map((f) => (
+              <circle key={f} cx={posX(f)} cy={TOP + GAP * 2.5} r="6.5" fill="#e8dfcb" opacity="0.85" />
+            ))}
+            {maxFret >= 12 && (
+              <>
+                <circle cx={posX(12)} cy={TOP + GAP * 1.5} r="6.5" fill="#e8dfcb" opacity="0.85" />
+                <circle cx={posX(12)} cy={TOP + GAP * 3.5} r="6.5" fill="#e8dfcb" opacity="0.85" />
+              </>
+            )}
+            {Array.from({ length: maxFret }, (_, i) => i + 1).map((f) => (
+              <text key={f} x={posX(f)} y={H - 6} textAnchor="middle" fontSize="11" fill="#7a6750" fontFamily="JetBrains Mono, monospace">{f}</text>
+            ))}
+            {STRINGS.map((st, s) => {
+              const pinned = phase !== "idle" && mode === "find" && stringSpecific && round && s === round.targetString;
+              return (
+                <g key={s}>
+                  <line x1={NUT - 7} x2={END} y1={stringY(s)} y2={stringY(s)}
+                    stroke={pinned ? "#f0bd6e" : s < 3 ? "#d8d2c4" : "#b3a184"} strokeWidth={(1 + s * 0.5) + (pinned ? 1 : 0)} />
+                  <text x={38} y={stringY(s) + 4} textAnchor="middle" fontSize="14" fontWeight="700"
+                    fill={pinned ? "#f0bd6e" : "#a08c75"} fontFamily="JetBrains Mono, monospace">{st.label}</text>
+                </g>
+              );
+            })}
+
+            {/* findall: positions already collected */}
+            {foundDots.map(({ s, f }) => (
+              <g key={`fd${s}-${f}`}>
+                <circle cx={posX(f)} cy={stringY(s)} r="13" fill="#84b56f" />
+                <text x={posX(f)} y={stringY(s) + 4} textAnchor="middle" fontSize="11" fontWeight="800" fill="#15200f"
+                  fontFamily="JetBrains Mono, monospace">{round.targetNote}</text>
+              </g>
+            ))}
+
+            {/* reveal missed positions after a fail */}
+            {showReveal && revealPositions.map(({ s, f }) => (
+              <g key={`r${s}-${f}`}>
+                <circle cx={posX(f)} cy={stringY(s)} r="13" fill={mode === "findall" ? "none" : "#84b56f"}
+                  stroke="#84b56f" strokeWidth={mode === "findall" ? 2.5 : 0} />
+                <text x={posX(f)} y={stringY(s) + 4} textAnchor="middle" fontSize="11" fontWeight="800"
+                  fill={mode === "findall" ? "#84b56f" : "#15200f"} fontFamily="JetBrains Mono, monospace">{round.targetNote}</text>
+              </g>
+            ))}
+
+            {/* wrong / correct click markers */}
+            {phase === "feedback" && feedback?.clickedPos && feedback.type === "wrong" && (
+              <circle cx={posX(feedback.clickedPos.f)} cy={stringY(feedback.clickedPos.s)} r="13"
+                fill="none" stroke="#cd5b4d" strokeWidth="3" />
+            )}
+            {phase === "feedback" && feedback?.clickedPos && feedback.type === "correct" && (
+              <g>
+                <circle cx={posX(feedback.clickedPos.f)} cy={stringY(feedback.clickedPos.s)} r="13" fill="#84b56f" />
+                <text x={posX(feedback.clickedPos.f)} y={stringY(feedback.clickedPos.s) + 4} textAnchor="middle"
+                  fontSize="11" fontWeight="800" fill="#15200f" fontFamily="JetBrains Mono, monospace">{round.targetNote}</text>
+              </g>
+            )}
+
+            {/* name-mode highlight */}
+            {round && mode === "name" && (phase === "playing" || phase === "feedback") && (
+              <g>
+                <circle className={phase === "playing" ? "ft-pulse" : ""} cx={posX(round.targetPos.f)} cy={stringY(round.targetPos.s)} r="13"
+                  fill={phase === "feedback" ? (feedback?.type === "correct" ? "#84b56f" : "#cd5b4d") : "#d49a43"} />
+                {phase === "feedback" && (
+                  <text x={posX(round.targetPos.f)} y={stringY(round.targetPos.s) + 4} textAnchor="middle"
+                    fontSize="11" fontWeight="800" fill="#1d1206" fontFamily="JetBrains Mono, monospace">{truthNote}</text>
+                )}
+              </g>
+            )}
+
+            {/* click targets */}
+            {clickable && Array.from({ length: 6 }, (_, s) =>
+              Array.from({ length: maxFret + 1 }, (_, f) => (
+                <g key={`c${s}-${f}`} className="ft-cell" onClick={() => handleFretClick(s, f)}>
+                  <circle className="ft-hover" cx={posX(f)} cy={stringY(s)} r="11" fill="#d49a43" opacity="0"
+                    style={{ transition: "opacity .12s" }} />
+                  <circle cx={posX(f)} cy={stringY(s)} r="16" fill="transparent" />
+                </g>
+              ))
+            )}
+          </svg>
+        </div>
+
+        {/* prompt */}
+        <div className="ft-prompt">
+          {phase === "idle" && (
+            <div className="ft-task" style={{ maxWidth: 460, textAlign: "center" }}>
+              {mode === "find" && !stringSpecific && "A note name will appear here — tap any of its positions on the fretboard before the timer runs out."}
+              {mode === "find" && stringSpecific && "A note and a string will appear here — tap that note on that exact string. Other strings don't count."}
+              {mode === "findall" && "A note will appear here — tap every position of it on the neck. The timer scales with how many there are. One wrong tap ends the round."}
+              {mode === "name" && "A position will light up on the fretboard — pick its note name below before the timer runs out."}
+            </div>
+          )}
+
+          {phase === "playing" && mode === "find" && (
+            <>
+              <div className="ft-target">{round.targetNote}</div>
+              <div className="ft-task">
+                {stringSpecific
+                  ? <>on the <b>{stringName(round.targetString)}</b> string only</>
+                  : "find it anywhere on the fretboard"}
+              </div>
+            </>
+          )}
+
+          {phase === "playing" && mode === "findall" && (
+            <>
+              <div className="ft-target">{round.targetNote}</div>
+              <div className="ft-task">
+                find <b>all</b> positions
+                <div className="ft-count">{found.length} / {round.positions.length} found</div>
+              </div>
+            </>
+          )}
+
+          {phase === "playing" && mode === "name" && (
+            <div className="ft-notes">
+              {answerPool.map((n) => (
+                <button key={n} className="ft-notebtn" onClick={() => handleAnswer(n)}>{n}</button>
+              ))}
+            </div>
+          )}
+
+          {phase === "feedback" && mode !== "name" && (
+            <div className={`ft-verdict ${feedback.type === "correct" ? "ok" : "no"}`}>
+              {feedback.type === "correct"
+                ? (mode === "findall" ? `✓ all ${round.positions.length} found` : `✓ ${round.targetNote}`)
+                : feedback.type === "timeout"
+                ? (mode === "findall" ? `time — ${revealPositions.length} missed` : `time — ${round.targetNote} was here`)
+                : (mode === "findall" ? "wrong note — here's the rest" : `not quite — ${round.targetNote} is here`)}
+            </div>
+          )}
+
+          {phase === "feedback" && mode === "name" && (
+            <div className="ft-notes">
+              {answerPool.map((n) => (
+                <button key={n} disabled
+                  className={"ft-notebtn" + (n === truthNote ? " right" : n === feedback.chosenNote ? " wrongpick" : "")}>
+                  {n}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {phase === "playing" && (
+            <div className={`ft-timer ${progress < 0.3 ? "low" : ""}`} style={{ width: `${progress * 100}%` }} />
+          )}
+        </div>
+
+        {/* controls */}
+        <div className="ft-controls">
+          <div className="ft-field">
+            <span>drill</span>
+            <div className="ft-seg">
+              <button className={mode === "find" ? "on" : ""} onClick={() => setMode("find")}>find the note</button>
+              <button className={mode === "findall" ? "on" : ""} onClick={() => setMode("findall")}>find all</button>
+              <button className={mode === "name" ? "on" : ""} onClick={() => setMode("name")}>name the note</button>
+            </div>
+          </div>
+          {mode === "find" && (
+            <div className="ft-field">
+              <span>coverage</span>
+              <div className="ft-seg">
+                <button className={!stringSpecific ? "on" : ""} onClick={() => setStringSpecific(false)}>any string</button>
+                <button className={stringSpecific ? "on" : ""} onClick={() => setStringSpecific(true)}>specific string</button>
+              </div>
+            </div>
+          )}
+          <div className="ft-field">
+            <span>{mode === "findall" ? "timer (per position)" : "timer"}</span>
+            <div className="ft-range">
+              <input className="ft-slider" type="range" min="1" max="10" step="0.5" value={timeLimit}
+                onChange={(e) => { setTimeLimit(+e.target.value); stop(); }} />
+              <span className="ft-val">{timeLimit}s</span>
+            </div>
+          </div>
+          <div className="ft-field">
+            <span>frets</span>
+            <div className="ft-seg">
+              {[5, 7, 12].map((f) => (
+                <button key={f} className={maxFret === f ? "on" : ""} onClick={() => setMaxFret(f)}>0–{f}</button>
+              ))}
+            </div>
+          </div>
+          <div className="ft-field">
+            <span>notes</span>
+            <label className="ft-check">
+              <input type="checkbox" checked={!naturalsOnly} onChange={(e) => setNaturalsOnly(!e.target.checked)} />
+              include ♯/♭
+            </label>
+          </div>
+          <div className="ft-field">
+            <span>sound</span>
+            <label className="ft-check">
+              <input type="checkbox" checked={soundOn} onChange={(e) => setSoundOn(e.target.checked)} />
+              play pitches
+            </label>
+          </div>
+          {phase === "idle"
+            ? <button className="ft-go" onClick={startRound}>Start drill</button>
+            : <button className="ft-go stop" onClick={stop}>Stop</button>}
+        </div>
+
+        {/* stats */}
+        <div className="ft-stats">
+          <span><b>{stats.correct}/{stats.total}</b>correct</span>
+          <span><b>{stats.streak}</b>streak</span>
+          <span><b>{stats.best}</b>best streak</span>
+          <span><b>{avg}{stats.correct ? "s" : ""}</b>avg speed</span>
+        </div>
+        <div className="ft-hint">
+          progression: any string → specific string → find all · then tighten the timer
+        </div>
+      </div>
+    </div>
+  );
+}
