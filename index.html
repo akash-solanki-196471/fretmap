@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Fretmap — guitar fretboard note trainer</title>
-<meta name="description" content="Memorize the notes on a standard-tuned guitar neck. Timed drills: find the note, find all positions, name the highlighted note. With real plucked-string audio.">
+<meta name="description" content="Memorize the notes on a standard-tuned guitar neck. Drills at your own pace or against the clock: find the note, find all positions, name the highlighted note. Tracks your weak spots and levels you up.">
 <style>html,body{margin:0;padding:0;background:#171210}</style>
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -37,14 +37,43 @@ const key = (s, f) => `${s}-${f}`;
 const W = 1000, H = 280, NUT = 92, END = 982, TOP = 38, GAP = 41;
 const stringY = (s) => TOP + GAP * s;
 
+// ---------- persistent progress (localStorage) ----------
+const STORE_KEY = "fretmap-progress-v1";
+const emptyStore = () => ({
+  xp: 0, totalCorrect: 0, totalAnswered: 0, bestStreakEver: 0,
+  lastDay: null, dayStreak: 0,
+  noteStats: {}, // note -> { ok, n }
+  lastSession: null, // { correct, total, avg, xp }
+});
+const loadStore = () => {
+  try { return { ...emptyStore(), ...(JSON.parse(localStorage.getItem(STORE_KEY)) || {}) }; }
+  catch (e) { return emptyStore(); }
+};
+const saveStore = (st) => { try { localStorage.setItem(STORE_KEY, JSON.stringify(st)); } catch (e) {} };
+const localDay = (d = new Date()) => `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+
+// streak milestones (à la guitarorb): hit these in a row for bonus XP
+const STREAK_BONUS = { 5: 25, 10: 50, 20: 100, 40: 200 };
+const XP_CORRECT = 10;
+// level curve: 200 XP for level 2, each level ~20% more
+const levelFromXp = (xp) => {
+  let level = 1, need = 200, rem = xp;
+  while (rem >= need) { rem -= need; level++; need = Math.round(need * 1.2); }
+  return { level, into: rem, need };
+};
+
+const FEEDBACK_REPO = "akash-solanki-196471/fretmap";
+
 function FretboardTrainer() {
   // settings
   const [mode, setMode] = useState("find"); // 'find' | 'findall' | 'name'
   const [stringSpecific, setStringSpecific] = useState(false); // find mode: pin to one string
-  const [timeLimit, setTimeLimit] = useState(3);
+  const [pace, setPace] = useState("timed"); // 'relaxed' (no countdown) | 'timed'
+  const [timeLimit, setTimeLimit] = useState(6);
   const [maxFret, setMaxFret] = useState(12);
   const [naturalsOnly, setNaturalsOnly] = useState(true);
   const [soundOn, setSoundOn] = useState(true);
+  const [focusWeak, setFocusWeak] = useState(true); // adaptive: drill your weak spots more
 
   // session
   const [phase, setPhase] = useState("idle"); // idle | playing | feedback
@@ -53,16 +82,28 @@ function FretboardTrainer() {
   const [feedback, setFeedback] = useState(null);
   const [progress, setProgress] = useState(1);
   const [stats, setStats] = useState({ correct: 0, total: 0, streak: 0, best: 0, timeSum: 0 });
+  const [sessionXp, setSessionXp] = useState(0);
+  const [summary, setSummary] = useState(null); // shown after Stop: this session vs last
+
+  // lifetime progress
+  const [store, setStore] = useState(loadStore);
+  const storeRef = useRef(store);
+  useEffect(() => { storeRef.current = store; saveStore(store); }, [store]);
 
   const timerRef = useRef(null);
+  const roundRef = useRef(null); // current round for callbacks that outlive the render (timeout)
   const advanceRef = useRef(null);
   const startedAtRef = useRef(0);
-  const limitRef = useRef(3);
+  const limitRef = useRef(6);
   const lastTargetRef = useRef(null);
   const foundRef = useRef([]);
   const audioRef = useRef(null);
   const soundOnRef = useRef(true);
   useEffect(() => { soundOnRef.current = soundOn; }, [soundOn]);
+
+  // feedback form
+  const [fbType, setFbType] = useState("idea");
+  const [fbText, setFbText] = useState("");
 
   // Karplus-Strong plucked string — no samples needed
   const pluck = (midi) => {
@@ -96,7 +137,7 @@ function FretboardTrainer() {
       src.start();
     } catch (e) { /* audio unavailable — drill works silently */ }
   };
-  const settingsKey = `${mode}|${stringSpecific}|${maxFret}|${naturalsOnly}`;
+  const settingsKey = `${mode}|${stringSpecific}|${maxFret}|${naturalsOnly}|${pace}`;
 
   const fretX = useMemo(() => {
     const span = 1 - Math.pow(2, -maxFret / 12);
@@ -131,13 +172,31 @@ function FretboardTrainer() {
 
   useEffect(() => () => { clearTimers(); audioRef.current?.close?.(); }, []);
 
+  // notes you miss most (≥4 attempts, under 85% accuracy) — the adaptive drill leans on these
+  const weakNotesIn = (pool) => {
+    const ns = storeRef.current.noteStats;
+    return pool
+      .filter((n) => ns[n] && ns[n].n >= 4 && ns[n].ok / ns[n].n < 0.85)
+      .sort((a, b) => ns[a].ok / ns[a].n - ns[b].ok / ns[b].n)
+      .slice(0, 3);
+  };
+
   const pickRound = () => {
     const pool = naturalsOnly ? NATURALS : NOTES;
+    const weak = focusWeak ? weakNotesIn(pool) : [];
     for (let i = 0; i < 80; i++) {
-      const s = Math.floor(Math.random() * 6);
-      const f = Math.floor(Math.random() * (maxFret + 1));
-      const n = noteAt(s, f);
-      if (!pool.includes(n)) continue;
+      let s, f, n;
+      if (weak.length && Math.random() < 0.45) {
+        n = weak[Math.floor(Math.random() * weak.length)];
+        const ps = allPositionsOf(n);
+        const p = ps[Math.floor(Math.random() * ps.length)];
+        s = p.s; f = p.f;
+      } else {
+        s = Math.floor(Math.random() * 6);
+        f = Math.floor(Math.random() * (maxFret + 1));
+        n = noteAt(s, f);
+        if (!pool.includes(n)) continue;
+      }
       const k = mode === "name" ? key(s, f) : mode === "find" && stringSpecific ? `${n}@${s}` : n;
       if (k === lastTargetRef.current && i < 70) continue;
       lastTargetRef.current = k;
@@ -151,8 +210,10 @@ function FretboardTrainer() {
   const startRound = () => {
     clearTimers();
     setFeedback(null);
+    setSummary(null);
     const r = pickRound();
     setRound(r);
+    roundRef.current = r;
     setFound([]);
     foundRef.current = [];
     // sound the target: exact position pitch, or a mid-neck reference for find-all
@@ -163,34 +224,68 @@ function FretboardTrainer() {
     }
     setPhase("playing");
     setProgress(1);
-    limitRef.current = mode === "findall" ? timeLimit * r.positions.length : timeLimit;
     startedAtRef.current = performance.now();
-    timerRef.current = setInterval(() => {
-      const el = (performance.now() - startedAtRef.current) / 1000;
-      const p = Math.max(0, 1 - el / limitRef.current);
-      setProgress(p);
-      if (p <= 0) {
-        clearInterval(timerRef.current);
-        finish("timeout");
-      }
-    }, 50);
+    if (pace === "timed") {
+      limitRef.current = mode === "findall" ? timeLimit * r.positions.length : timeLimit;
+      timerRef.current = setInterval(() => {
+        const el = (performance.now() - startedAtRef.current) / 1000;
+        const p = Math.max(0, 1 - el / limitRef.current);
+        setProgress(p);
+        if (p <= 0) {
+          clearInterval(timerRef.current);
+          finish("timeout");
+        }
+      }, 50);
+    }
   };
 
   const finish = (type, extra = {}) => {
     clearTimers();
     const elapsed = (performance.now() - startedAtRef.current) / 1000;
-    setStats((st) => {
-      const ok = type === "correct";
-      const streak = ok ? st.streak + 1 : 0;
+    const ok = type === "correct";
+    const newStreak = ok ? stats.streak + 1 : 0;
+
+    // XP: base per correct, speed bonus when beating half the clock, streak milestone bonuses
+    let gain = 0, bonus = 0;
+    if (ok) {
+      gain = XP_CORRECT;
+      if (pace === "timed" && elapsed < limitRef.current / 2) gain += 5;
+      bonus = STREAK_BONUS[newStreak] || 0;
+      gain += bonus;
+    }
+
+    setStats((st) => ({
+      correct: st.correct + (ok ? 1 : 0),
+      total: st.total + 1,
+      streak: newStreak,
+      best: Math.max(st.best, newStreak),
+      timeSum: st.timeSum + (ok ? elapsed : 0),
+    }));
+    setSessionXp((x) => x + gain);
+
+    // lifetime progress: totals, per-note accuracy, day streak
+    setStore((prev) => {
+      const today = localDay();
+      const yesterday = localDay(new Date(Date.now() - 864e5));
+      const ns = { ...prev.noteStats };
+      const target = roundRef.current?.targetNote;
+      if (target) {
+        const cur = ns[target] || { ok: 0, n: 0 };
+        ns[target] = { ok: cur.ok + (ok ? 1 : 0), n: cur.n + 1 };
+      }
       return {
-        correct: st.correct + (ok ? 1 : 0),
-        total: st.total + 1,
-        streak,
-        best: Math.max(st.best, streak),
-        timeSum: st.timeSum + (ok ? elapsed : 0),
+        ...prev,
+        xp: prev.xp + gain,
+        totalCorrect: prev.totalCorrect + (ok ? 1 : 0),
+        totalAnswered: prev.totalAnswered + 1,
+        bestStreakEver: Math.max(prev.bestStreakEver, newStreak),
+        noteStats: ns,
+        lastDay: today,
+        dayStreak: prev.lastDay === today ? prev.dayStreak : prev.lastDay === yesterday ? prev.dayStreak + 1 : 1,
       };
     });
-    setFeedback({ type, ...extra });
+
+    setFeedback({ type, bonus, bonusStreak: newStreak, ...extra });
     setPhase("feedback");
     advanceRef.current = setTimeout(startRound, type === "correct" ? 800 : 1800);
   };
@@ -231,6 +326,29 @@ function FretboardTrainer() {
     setFound([]);
     setFeedback(null);
     setProgress(1);
+    // session recap vs your previous session
+    if (stats.total > 0) {
+      const cur = {
+        correct: stats.correct,
+        total: stats.total,
+        avg: stats.correct ? stats.timeSum / stats.correct : null,
+        xp: sessionXp,
+      };
+      setSummary({ cur, prev: storeRef.current.lastSession });
+      setStore((p) => ({ ...p, lastSession: cur }));
+      setStats({ correct: 0, total: 0, streak: 0, best: 0, timeSum: 0 });
+      setSessionXp(0);
+    }
+  };
+
+  const sendFeedback = () => {
+    const text = fbText.trim();
+    if (!text) return;
+    const tag = fbType === "bug" ? "Bug" : fbType === "idea" ? "Idea" : "Feedback";
+    const title = encodeURIComponent(`[${tag}] ${text.slice(0, 60)}${text.length > 60 ? "…" : ""}`);
+    const body = encodeURIComponent(`${text}\n\n---\n_sent from the Fretmap feedback form_`);
+    window.open(`https://github.com/${FEEDBACK_REPO}/issues/new?title=${title}&body=${body}`, "_blank", "noopener");
+    setFbText("");
   };
 
   // positions to reveal after a miss
@@ -252,6 +370,11 @@ function FretboardTrainer() {
   const singleInlays = [3, 5, 7, 9].filter((f) => f <= maxFret);
   const clickable = mode !== "name";
 
+  const lv = levelFromXp(store.xp);
+  const lifetimeAcc = store.totalAnswered ? Math.round((store.totalCorrect / store.totalAnswered) * 100) : null;
+  const weakNow = weakNotesIn(answerPool);
+  const notesWithData = answerPool.filter((n) => store.noteStats[n]?.n > 0);
+
   return (
     <div className="ft-root">
       <style>{`
@@ -270,6 +393,9 @@ function FretboardTrainer() {
         .ft-title{font-family:'Fraunces',serif;font-weight:700;font-size:clamp(22px,3.4vw,32px);letter-spacing:.01em;margin:0}
         .ft-title em{font-style:normal;color:var(--brass)}
         .ft-sub{color:var(--dim);font-size:12px}
+        .ft-badges{display:flex;gap:10px;align-items:center;font-size:12px}
+        .ft-lvl{background:var(--brass);color:#241804;font-weight:800;border-radius:8px;padding:4px 10px}
+        .ft-flame{color:var(--brass2);font-weight:600}
         .ft-board{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 10px 8px;overflow-x:auto}
         .ft-board svg{display:block;min-width:680px;width:100%;height:auto}
         .ft-cell{cursor:pointer}
@@ -284,6 +410,12 @@ function FretboardTrainer() {
         .ft-timer.low{background:var(--bad)}
         .ft-verdict{font-size:clamp(22px,3.4vw,34px);font-weight:800}
         .ft-verdict.ok{color:var(--good)} .ft-verdict.no{color:var(--bad)}
+        .ft-bonus{position:absolute;top:8px;right:12px;background:var(--brass2);color:#241804;font-weight:800;font-size:12px;
+          border-radius:8px;padding:4px 10px;animation:ftpop .3s ease-out}
+        @keyframes ftpop{0%{transform:scale(.6);opacity:0}100%{transform:scale(1);opacity:1}}
+        .ft-summary{text-align:center;font-size:13px;color:var(--dim);line-height:1.9}
+        .ft-summary b{color:var(--brass2);font-size:16px}
+        .ft-summary .up{color:var(--good)} .ft-summary .down{color:var(--bad)}
         .ft-notes{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
         .ft-notebtn{font-family:inherit;font-weight:800;font-size:18px;min-width:52px;padding:12px 8px;border-radius:10px;
           border:1px solid var(--line);background:var(--panel2);color:var(--ink);cursor:pointer}
@@ -309,16 +441,44 @@ function FretboardTrainer() {
         .ft-go:focus-visible{outline:2px solid var(--brass2);outline-offset:2px}
         .ft-stats{display:flex;gap:22px;flex-wrap:wrap;margin-top:12px;padding:0 6px;color:var(--dim);font-size:12px}
         .ft-stats b{color:var(--ink);font-size:15px;margin-right:5px}
+        .ft-stats .xp b{color:var(--brass2)}
         .ft-hint{color:var(--dim);font-size:11px;margin-top:8px;padding:0 6px}
+        .ft-panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;margin-top:14px;padding:16px 18px}
+        .ft-panel h2{font-family:'Fraunces',serif;font-size:17px;margin:0 0 4px;color:var(--ink)}
+        .ft-panel .ft-sub2{color:var(--dim);font-size:12px;margin:0 0 12px}
+        .ft-lvlbar{height:8px;border-radius:6px;background:var(--panel2);overflow:hidden;margin:8px 0 4px}
+        .ft-lvlbar i{display:block;height:100%;background:linear-gradient(90deg,var(--brass),var(--brass2));border-radius:6px}
+        .ft-lvlrow{display:flex;justify-content:space-between;font-size:11px;color:var(--dim)}
+        .ft-life{display:flex;gap:22px;flex-wrap:wrap;margin-top:12px;color:var(--dim);font-size:12px}
+        .ft-life b{color:var(--ink);font-size:15px;margin-right:5px}
+        .ft-weak{margin-top:12px;font-size:12px;color:var(--dim)}
+        .ft-chip{display:inline-block;background:var(--bad);color:#2a0f0a;font-weight:800;border-radius:7px;padding:3px 9px;margin:0 4px}
+        .ft-notebars{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px 16px;margin-top:12px}
+        .ft-nb{display:flex;align-items:center;gap:8px;font-size:12px}
+        .ft-nb b{width:22px;color:var(--ink)}
+        .ft-nb .bar{flex:1;height:7px;border-radius:5px;background:var(--panel2);overflow:hidden}
+        .ft-nb .bar i{display:block;height:100%;border-radius:5px}
+        .ft-nb .pct{width:34px;text-align:right;color:var(--dim);font-size:11px}
+        .ft-fbrow{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-start}
+        .ft-fbta{flex:1;min-width:240px;font-family:inherit;font-size:13px;color:var(--ink);background:var(--panel2);
+          border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-height:64px;resize:vertical;box-sizing:border-box}
+        .ft-fbta:focus-visible{outline:2px solid var(--brass2);outline-offset:1px}
+        .ft-fbsend{font-family:inherit;font-weight:800;font-size:13px;padding:11px 18px;border-radius:10px;border:0;
+          cursor:pointer;background:var(--brass);color:#241804;align-self:flex-end}
+        .ft-fbsend:disabled{opacity:.4;cursor:default}
         @keyframes ftpulse{0%,100%{r:13}50%{r:16}}
         .ft-pulse{animation:ftpulse 1s ease-in-out infinite}
-        @media (prefers-reduced-motion: reduce){ .ft-pulse{animation:none} }
+        @media (prefers-reduced-motion: reduce){ .ft-pulse{animation:none} .ft-bonus{animation:none} }
       `}</style>
 
       <div className="ft-wrap">
         <div className="ft-head">
           <h1 className="ft-title">Fret<em>map</em></h1>
-          <div className="ft-sub">standard tuning · E A D G B e</div>
+          <div className="ft-badges">
+            <span className="ft-lvl">LVL {lv.level}</span>
+            {store.dayStreak > 1 && <span className="ft-flame">🔥 {store.dayStreak}-day streak</span>}
+            <span className="ft-sub">standard tuning · E A D G B e</span>
+          </div>
         </div>
 
         {/* fretboard */}
@@ -419,12 +579,34 @@ function FretboardTrainer() {
 
         {/* prompt */}
         <div className="ft-prompt">
-          {phase === "idle" && (
+          {phase === "idle" && summary && (
+            <div className="ft-summary">
+              <div>session: <b>{summary.cur.correct}/{summary.cur.total}</b> correct
+                {summary.cur.avg != null && <> · avg <b>{summary.cur.avg.toFixed(2)}s</b></>}
+                {" "}· <b>+{summary.cur.xp} XP</b></div>
+              {summary.prev && summary.prev.total > 0 && (() => {
+                const accNow = summary.cur.correct / summary.cur.total;
+                const accPrev = summary.prev.correct / summary.prev.total;
+                const dAcc = Math.round((accNow - accPrev) * 100);
+                const dSpd = summary.cur.avg != null && summary.prev.avg != null ? summary.prev.avg - summary.cur.avg : null;
+                return (
+                  <div>vs last session:{" "}
+                    <span className={dAcc >= 0 ? "up" : "down"}>{dAcc >= 0 ? "▲" : "▼"} {Math.abs(dAcc)}% accuracy</span>
+                    {dSpd != null && <>{" · "}
+                      <span className={dSpd >= 0 ? "up" : "down"}>{dSpd >= 0 ? "▲" : "▼"} {Math.abs(dSpd).toFixed(2)}s {dSpd >= 0 ? "faster" : "slower"}</span></>}
+                  </div>
+                );
+              })()}
+              <div style={{ color: "var(--dim)", fontSize: 11 }}>hit Start to beat it</div>
+            </div>
+          )}
+
+          {phase === "idle" && !summary && (
             <div className="ft-task" style={{ maxWidth: 460, textAlign: "center" }}>
-              {mode === "find" && !stringSpecific && "A note name will appear here — tap any of its positions on the fretboard before the timer runs out."}
+              {mode === "find" && !stringSpecific && "A note name will appear here — tap any of its positions on the fretboard. Relaxed pace has no clock; timed races the bar."}
               {mode === "find" && stringSpecific && "A note and a string will appear here — tap that note on that exact string. Other strings don't count."}
-              {mode === "findall" && "A note will appear here — tap every position of it on the neck. The timer scales with how many there are. One wrong tap ends the round."}
-              {mode === "name" && "A position will light up on the fretboard — pick its note name below before the timer runs out."}
+              {mode === "findall" && "A note will appear here — tap every position of it on the neck. One wrong tap ends the round."}
+              {mode === "name" && "A position will light up on the fretboard — pick its note name below."}
             </div>
           )}
 
@@ -478,8 +660,12 @@ function FretboardTrainer() {
             </div>
           )}
 
-          {phase === "playing" && (
-            <div className={`ft-timer ${progress < 0.3 ? "low" : ""}`} style={{ width: `${progress * 100}%` }} />
+          {phase === "feedback" && feedback?.bonus > 0 && (
+            <div className="ft-bonus">{feedback.bonusStreak} in a row! +{feedback.bonus} XP</div>
+          )}
+
+          {phase === "playing" && pace === "timed" && (
+            <div className={`ft-timer ${progress < 0.2 ? "low" : ""}`} style={{ width: `${progress * 100}%` }} />
           )}
         </div>
 
@@ -503,13 +689,22 @@ function FretboardTrainer() {
             </div>
           )}
           <div className="ft-field">
-            <span>{mode === "findall" ? "timer (per position)" : "timer"}</span>
-            <div className="ft-range">
-              <input className="ft-slider" type="range" min="1" max="10" step="0.5" value={timeLimit}
-                onChange={(e) => { setTimeLimit(+e.target.value); stop(); }} />
-              <span className="ft-val">{timeLimit}s</span>
+            <span>pace</span>
+            <div className="ft-seg">
+              <button className={pace === "relaxed" ? "on" : ""} onClick={() => setPace("relaxed")}>relaxed</button>
+              <button className={pace === "timed" ? "on" : ""} onClick={() => setPace("timed")}>timed</button>
             </div>
           </div>
+          {pace === "timed" && (
+            <div className="ft-field">
+              <span>{mode === "findall" ? "timer (per position)" : "timer"}</span>
+              <div className="ft-range">
+                <input className="ft-slider" type="range" min="2" max="15" step="0.5" value={timeLimit}
+                  onChange={(e) => { setTimeLimit(+e.target.value); stop(); }} />
+                <span className="ft-val">{timeLimit}s</span>
+              </div>
+            </div>
+          )}
           <div className="ft-field">
             <span>frets</span>
             <div className="ft-seg">
@@ -526,6 +721,13 @@ function FretboardTrainer() {
             </label>
           </div>
           <div className="ft-field">
+            <span>adaptive</span>
+            <label className="ft-check">
+              <input type="checkbox" checked={focusWeak} onChange={(e) => setFocusWeak(e.target.checked)} />
+              drill weak spots
+            </label>
+          </div>
+          <div className="ft-field">
             <span>sound</span>
             <label className="ft-check">
               <input type="checkbox" checked={soundOn} onChange={(e) => setSoundOn(e.target.checked)} />
@@ -537,15 +739,74 @@ function FretboardTrainer() {
             : <button className="ft-go stop" onClick={stop}>Stop</button>}
         </div>
 
-        {/* stats */}
+        {/* session stats */}
         <div className="ft-stats">
           <span><b>{stats.correct}/{stats.total}</b>correct</span>
           <span><b>{stats.streak}</b>streak</span>
           <span><b>{stats.best}</b>best streak</span>
           <span><b>{avg}{stats.correct ? "s" : ""}</b>avg speed</span>
+          <span className="xp"><b>+{sessionXp}</b>XP this session</span>
         </div>
         <div className="ft-hint">
-          progression: any string → specific string → find all · then tighten the timer
+          progression: relaxed → timed → specific string → find all · streaks of 5/10/20/40 earn bonus XP
+        </div>
+
+        {/* lifetime progress */}
+        <div className="ft-panel">
+          <h2>Your progress</h2>
+          <p className="ft-sub2">saved on this device — every correct answer earns XP, streaks earn bonuses</p>
+          <div className="ft-lvlbar"><i style={{ width: `${Math.min(100, (lv.into / lv.need) * 100)}%` }} /></div>
+          <div className="ft-lvlrow">
+            <span>Level {lv.level}</span>
+            <span>{lv.into} / {lv.need} XP to level {lv.level + 1}</span>
+          </div>
+          <div className="ft-life">
+            <span><b>{store.xp}</b>total XP</span>
+            <span><b>{store.totalCorrect}/{store.totalAnswered}</b>lifetime correct{lifetimeAcc != null ? ` (${lifetimeAcc}%)` : ""}</span>
+            <span><b>{store.bestStreakEver}</b>best streak ever</span>
+            <span><b>{store.dayStreak || 0}</b>day streak</span>
+          </div>
+          {weakNow.length > 0 && (
+            <div className="ft-weak">
+              weak spots — the drill is serving these more often:
+              {weakNow.map((n) => <span key={n} className="ft-chip">{n}</span>)}
+            </div>
+          )}
+          {notesWithData.length > 0 && (
+            <div className="ft-notebars">
+              {notesWithData.map((n) => {
+                const d = store.noteStats[n];
+                const pct = Math.round((d.ok / d.n) * 100);
+                const col = pct >= 85 ? "var(--good)" : pct >= 60 ? "var(--brass)" : "var(--bad)";
+                return (
+                  <div key={n} className="ft-nb">
+                    <b>{n}</b>
+                    <span className="bar"><i style={{ width: `${pct}%`, background: col }} /></span>
+                    <span className="pct">{pct}%</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* feedback */}
+        <div className="ft-panel">
+          <h2>Feedback</h2>
+          <p className="ft-sub2">how are you using Fretmap? what's missing, broken, or great? — it lands straight in the project tracker</p>
+          <div className="ft-fbrow">
+            <div className="ft-seg" style={{ alignSelf: "flex-start" }}>
+              <button className={fbType === "idea" ? "on" : ""} onClick={() => setFbType("idea")}>💡 idea</button>
+              <button className={fbType === "bug" ? "on" : ""} onClick={() => setFbType("bug")}>🐞 bug</button>
+              <button className={fbType === "other" ? "on" : ""} onClick={() => setFbType("other")}>💬 other</button>
+            </div>
+            <textarea className="ft-fbta" placeholder="e.g. I use this 10 minutes before band practice — would love a left-handed mode"
+              value={fbText} onChange={(e) => setFbText(e.target.value)} />
+            <button className="ft-fbsend" disabled={!fbText.trim()} onClick={sendFeedback}>Send feedback</button>
+          </div>
+          <div className="ft-hint" style={{ padding: 0, marginTop: 8 }}>
+            opens a prefilled GitHub issue — or browse <a href={`https://github.com/${FEEDBACK_REPO}/issues`} target="_blank" rel="noopener" style={{ color: "var(--brass2)" }}>what others said</a>
+          </div>
         </div>
       </div>
     </div>
