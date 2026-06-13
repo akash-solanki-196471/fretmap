@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from "react";
+const { useState, useEffect, useRef, useMemo } = React;
 
 
 // ---------- music data ----------
@@ -49,11 +49,11 @@ const levelFromXp = (xp) => {
 
 const FEEDBACK_REPO = "akash-solanki-196471/fretmap";
 
-export default function FretboardTrainer() {
+function FretboardTrainer() {
   // settings
   const [mode, setMode] = useState("find"); // 'find' | 'findall' | 'name'
-  const [stringSpecific, setStringSpecific] = useState(false); // find mode: pin to one string
-  const [practiceString, setPracticeString] = useState("any"); // 'any' = random each round | 0..5 = always that string
+  const [stringSpecific, setStringSpecific] = useState(false); // pin to one string
+  const [practiceString, setPracticeString] = useState("any"); // 'any' = random | 0..5 = always that string
   const [pace, setPace] = useState("timed"); // 'relaxed' (no countdown) | 'timed'
   const [timeLimit, setTimeLimit] = useState(6);
   const [maxFret, setMaxFret] = useState(12);
@@ -86,6 +86,9 @@ export default function FretboardTrainer() {
   const audioRef = useRef(null);
   const soundOnRef = useRef(true);
   useEffect(() => { soundOnRef.current = soundOn; }, [soundOn]);
+  // keep a ref so pickRound (called from async timeouts) always sees the latest value
+  const practiceStringRef = useRef(practiceString);
+  useEffect(() => { practiceStringRef.current = practiceString; }, [practiceString]);
 
   // feedback form
   const [fbType, setFbType] = useState("idea");
@@ -149,7 +152,8 @@ export default function FretboardTrainer() {
       src.start();
     } catch (e) { /* audio unavailable — drill works silently */ }
   };
-  const settingsKey = `${mode}|${stringSpecific}|${practiceString}|${maxFret}|${naturalsOnly}|${pace}`;
+  // practiceString deliberately excluded — switching string mid-drill takes effect next round
+  const settingsKey = `${mode}|${stringSpecific}|${maxFret}|${naturalsOnly}|${pace}`;
 
   const fretX = useMemo(() => {
     const span = 1 - Math.pow(2, -maxFret / 12);
@@ -195,19 +199,21 @@ export default function FretboardTrainer() {
 
   const pickRound = () => {
     const pool = naturalsOnly ? NATURALS : NOTES;
-    const pinned = mode === "find" && stringSpecific && practiceString !== "any";
+    const ps = practiceStringRef.current; // always current even from async callbacks
+    const pinned = stringSpecific && ps !== "any";
+    const pinnedS = pinned ? ps : null;
     const weak = focusWeak && !pinned ? weakNotesIn(pool) : [];
     for (let i = 0; i < 80; i++) {
       let s, f, n;
       if (pinned) {
-        s = practiceString;
+        s = pinnedS;
         f = Math.floor(Math.random() * (maxFret + 1));
         n = noteAt(s, f);
         if (!pool.includes(n)) continue;
       } else if (weak.length && Math.random() < 0.45) {
         n = weak[Math.floor(Math.random() * weak.length)];
-        const ps = allPositionsOf(n);
-        const p = ps[Math.floor(Math.random() * ps.length)];
+        const wp = allPositionsOf(n);
+        const p = wp[Math.floor(Math.random() * wp.length)];
         s = p.s; f = p.f;
       } else {
         s = Math.floor(Math.random() * 6);
@@ -215,14 +221,23 @@ export default function FretboardTrainer() {
         n = noteAt(s, f);
         if (!pool.includes(n)) continue;
       }
-      const k = mode === "name" ? key(s, f) : mode === "find" && stringSpecific ? `${n}@${s}` : n;
+      const k = stringSpecific ? `${n}@${s}` : mode === "name" ? key(s, f) : n;
       if (k === lastTargetRef.current && i < 70) continue;
       lastTargetRef.current = k;
-      if (mode === "findall") return { targetNote: n, positions: allPositionsOf(n) };
-      if (mode === "find" && stringSpecific) return { targetNote: n, targetString: s, targetPos: { s, f } };
-      return { targetNote: n, targetPos: { s, f } };
+      if (mode === "findall") {
+        const allPos = allPositionsOf(n);
+        const positions = pinned ? allPos.filter((p) => p.s === pinnedS) : allPos;
+        if (positions.length === 0) continue;
+        return { targetNote: n, positions, targetString: pinnedS };
+      }
+      // find and name both get targetString when pinned (name uses it for SVG highlight)
+      return { targetNote: n, targetPos: { s, f }, targetString: pinned ? s : s };
     }
-    return { targetNote: "E", targetPos: { s: 5, f: 0 }, positions: allPositionsOf("E") };
+    // fallback — should never be reached in practice
+    const fallbackS = pinned ? pinnedS : 5;
+    const fallbackF = 0;
+    const fallbackN = noteAt(fallbackS, fallbackF);
+    return { targetNote: fallbackN, targetPos: { s: fallbackS, f: fallbackF }, targetString: fallbackS, positions: allPositionsOf(fallbackN) };
   };
 
   const startRound = () => {
@@ -384,7 +399,7 @@ export default function FretboardTrainer() {
   const showReveal = phase === "feedback" && feedback && feedback.type !== "correct" && mode !== "name";
   const answerPool = naturalsOnly ? NATURALS : NOTES;
   const truthNote = round?.targetPos ? noteAt(round.targetPos.s, round.targetPos.f) : null;
-  const foundDots = (mode === "findall" && round) ? round.positions.filter((p) => found.includes(key(p.s, p.f))) : [];
+  const foundDots = (mode === "findall" && round?.positions) ? round.positions.filter((p) => found.includes(key(p.s, p.f))) : [];
   const singleInlays = [3, 5, 7, 9].filter((f) => f <= maxFret);
   const clickable = mode !== "name";
 
@@ -527,7 +542,7 @@ export default function FretboardTrainer() {
               <text key={f} x={posX(f)} y={H - 6} textAnchor="middle" fontSize="11" fill="#7a6750" fontFamily="JetBrains Mono, monospace">{f}</text>
             ))}
             {STRINGS.map((st, s) => {
-              const pinned = phase !== "idle" && mode === "find" && stringSpecific && round && s === round.targetString;
+              const pinned = phase !== "idle" && stringSpecific && practiceString !== "any" && s === practiceString;
               return (
                 <g key={s}>
                   <line x1={NUT - 7} x2={END} y1={stringY(s)} y2={stringY(s)}
@@ -571,7 +586,7 @@ export default function FretboardTrainer() {
             )}
 
             {/* name-mode highlight */}
-            {round && mode === "name" && (phase === "playing" || phase === "feedback") && (
+            {round && round.targetPos && mode === "name" && (phase === "playing" || phase === "feedback") && (
               <g>
                 <circle className={phase === "playing" ? "ft-pulse" : ""} cx={posX(round.targetPos.f)} cy={stringY(round.targetPos.s)} r="13"
                   fill={phase === "feedback" ? (feedback?.type === "correct" ? "#84b56f" : "#cd5b4d") : "#d49a43"} />
@@ -622,9 +637,14 @@ export default function FretboardTrainer() {
           {phase === "idle" && !summary && (
             <div className="ft-task" style={{ maxWidth: 460, textAlign: "center" }}>
               {mode === "find" && !stringSpecific && "A note name will appear here — tap any of its positions on the fretboard. Relaxed pace has no clock; timed races the bar."}
-              {mode === "find" && stringSpecific && "A note and a string will appear here — tap that note on that exact string. Other strings don't count."}
-              {mode === "findall" && "A note will appear here — tap every position of it on the neck. One wrong tap ends the round."}
-              {mode === "name" && "A position will light up on the fretboard — pick its note name below."}
+              {mode === "find" && stringSpecific && practiceString === "any" && "A note and a random string will appear — tap that note on that exact string only."}
+              {mode === "find" && stringSpecific && practiceString !== "any" && `A note will appear — tap it on the ${STRINGS[practiceString].label === "e" ? "high e" : STRINGS[practiceString].label === "E" ? "low E" : STRINGS[practiceString].label} string only.`}
+              {mode === "findall" && !stringSpecific && "A note will appear — tap every position of it across the whole neck. One wrong tap ends the round."}
+              {mode === "findall" && stringSpecific && practiceString === "any" && "A note will appear — tap every position of it on a single string. One wrong tap ends the round."}
+              {mode === "findall" && stringSpecific && practiceString !== "any" && `A note will appear — tap every position of it on the ${STRINGS[practiceString].label === "e" ? "high e" : STRINGS[practiceString].label === "E" ? "low E" : STRINGS[practiceString].label} string. One wrong tap ends the round.`}
+              {mode === "name" && !stringSpecific && "A position will light up anywhere on the fretboard — pick its note name below."}
+              {mode === "name" && stringSpecific && practiceString === "any" && "A position will light up on a single string — pick its note name below."}
+              {mode === "name" && stringSpecific && practiceString !== "any" && `A position on the ${STRINGS[practiceString].label === "e" ? "high e" : STRINGS[practiceString].label === "E" ? "low E" : STRINGS[practiceString].label} string will light up — pick its note name below.`}
             </div>
           )}
 
@@ -643,8 +663,8 @@ export default function FretboardTrainer() {
             <>
               <div className="ft-target">{round.targetNote}</div>
               <div className="ft-task">
-                find <b>all</b> positions
-                <div className="ft-count">{found.length} / {round.positions.length} found</div>
+                find <b>all</b> positions{round.targetString != null && <> on the <b>{stringName(round.targetString)}</b> string</>}
+                <div className="ft-count">{found.length} / {round.positions?.length ?? '…'} found</div>
               </div>
             </>
           )}
@@ -660,7 +680,7 @@ export default function FretboardTrainer() {
           {phase === "feedback" && mode !== "name" && (
             <div className={`ft-verdict ${feedback.type === "correct" ? "ok" : "no"}`}>
               {feedback.type === "correct"
-                ? (mode === "findall" ? `✓ all ${round.positions.length} found` : `✓ ${round.targetNote}`)
+                ? (mode === "findall" ? `✓ all ${round.positions?.length ?? ''} found` : `✓ ${round.targetNote}`)
                 : feedback.type === "timeout"
                 ? (mode === "findall" ? `time — ${revealPositions.length} missed` : `time — ${round.targetNote} was here`)
                 : (mode === "findall" ? "wrong note — here's the rest" : `not quite — ${round.targetNote} is here`)}
@@ -697,16 +717,14 @@ export default function FretboardTrainer() {
               <button className={mode === "name" ? "on" : ""} onClick={() => setMode("name")}>name the note</button>
             </div>
           </div>
-          {mode === "find" && (
-            <div className="ft-field">
-              <span>coverage</span>
-              <div className="ft-seg">
-                <button className={!stringSpecific ? "on" : ""} onClick={() => setStringSpecific(false)}>any string</button>
-                <button className={stringSpecific ? "on" : ""} onClick={() => setStringSpecific(true)}>specific string</button>
-              </div>
+          <div className="ft-field">
+            <span>coverage</span>
+            <div className="ft-seg">
+              <button className={!stringSpecific ? "on" : ""} onClick={() => setStringSpecific(false)}>any string</button>
+              <button className={stringSpecific ? "on" : ""} onClick={() => setStringSpecific(true)}>specific string</button>
             </div>
-          )}
-          {mode === "find" && stringSpecific && (
+          </div>
+          {stringSpecific && (
             <div className="ft-field">
               <span>which string</span>
               <div className="ft-seg">
